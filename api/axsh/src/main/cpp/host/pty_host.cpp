@@ -1,0 +1,501 @@
+#include <jni.h>
+#include <unistd.h>
+#include <termios.h>
+#include <fcntl.h>
+#include <cstdlib>
+#include <wait.h>
+#include <android/log.h>
+#include <pthread.h>
+#include <sys/resource.h>
+#include <sys/syscall.h>
+#include <dirent.h>
+#include <ctime>
+#include <climits>
+#include <cstring>
+#include <paths.h>
+#include "logging.h"
+#include "pts.h"
+
+/**
+ * execvp for a child that shares the server's memory (vfork): it searches the PATH of [envp]
+ * itself, because making [envp] our environ first (what execvp would search) would change the
+ * server's own. A bare command still follows the PATH order it was given (preferSystemBinaries).
+ * No allocation. Returns only on failure, with errno as execvp leaves it.
+ */
+static void exec_with_path(const char *file, char *const argv[], char *const envp[]) {
+    if (strchr(file, '/') != nullptr) {
+        execve(file, argv, envp);
+        return;
+    }
+    const char *path = _PATH_DEFPATH;
+    for (char *const *e = envp; e != nullptr && *e != nullptr; ++e) {
+        if (strncmp(*e, "PATH=", 5) == 0) {
+            path = *e + 5;
+            break;
+        }
+    }
+    const size_t file_len = strlen(file);
+    bool denied = false;
+    char candidate[PATH_MAX];
+    for (const char *dir = path;;) {
+        const char *end = strchr(dir, ':');
+        const size_t dir_len = end != nullptr ? static_cast<size_t>(end - dir) : strlen(dir);
+        if (dir_len + 1 + file_len + 1 <= sizeof(candidate)) {
+            size_t length = 0;
+            if (dir_len > 0) {
+                memcpy(candidate, dir, dir_len);
+                length = dir_len;
+                candidate[length++] = '/';
+            }
+            memcpy(candidate + length, file, file_len + 1);
+            execve(candidate, argv, envp);
+            if (errno == ENOEXEC) {
+                // A script with no #! line: the shell runs it, as execvp does.
+                const char *sh_argv[64];
+                int argc = 0;
+                while (argv[argc] != nullptr) ++argc;
+                if (argc < 62) {
+                    sh_argv[0] = "sh";
+                    sh_argv[1] = candidate;
+                    for (int i = 1; i <= argc; ++i) sh_argv[i + 1] = argv[i];
+                    execve("/system/bin/sh", const_cast<char *const *>(sh_argv), envp);
+                }
+            }
+            if (errno == EACCES) denied = true;
+        }
+        if (end == nullptr) break;
+        dir = end + 1;
+    }
+    errno = denied ? EACCES : ENOENT;
+}
+
+/**
+ * In the child, just before exec: the shell keeps stdin, stdout and stderr and nothing else of
+ * ours. Every fd the server has open is inherited otherwise, and outlives the server in each
+ * shell still running: its @axeron listener (a restarted server can't bind it), its pipes, other
+ * sessions' PTY masters. Raw syscalls: fdsan would abort on close() of an fd a Java object owns.
+ */
+static void close_inherited_fds(const int *open_fds, int open_count) {
+#ifdef __NR_close_range
+    if (syscall(__NR_close_range, 3u, ~0u, 0u) == 0) return;
+#endif
+    // Kernels before 5.9: only the fds that are open (listed before the fork, where reading
+    // /proc is safe), not every number up to the limit.
+    if (open_count >= 0) {
+        for (int i = 0; i < open_count; ++i) syscall(__NR_close, open_fds[i]);
+        return;
+    }
+    rlimit limit{};
+    const int max = getrlimit(RLIMIT_NOFILE, &limit) == 0 && limit.rlim_cur != RLIM_INFINITY
+                    ? static_cast<int>(limit.rlim_cur) : 4096;
+    for (int fd = 3; fd < max; ++fd) syscall(__NR_close, fd);
+}
+
+/** LOGD for the child, which under vfork shares the logger's state with the server. */
+#define CLOG(...) do { if (!quiet) LOGD(__VA_ARGS__); } while (0)
+
+/** Whether close_range exists here: probed once with a range that holds no fd. */
+static bool has_close_range() {
+#ifdef __NR_close_range
+    static const bool supported = syscall(__NR_close_range, ~0u, ~0u, 0u) == 0;
+    return supported;
+#else
+    return false;
+#endif
+}
+
+/**
+ * The open fds from 3 up, for a child that can't list them itself (no allocation after fork).
+ * -1 when /proc can't be read or there are more than [cap]: the child then closes every number.
+ */
+static int list_open_fds(int *out, int cap) {
+    DIR *dir = opendir("/proc/self/fd");
+    if (dir == nullptr) return -1;
+    const int self = dirfd(dir);
+    int count = 0;
+    while (dirent *entry = readdir(dir)) {
+        const int fd = atoi(entry->d_name);
+        if (fd < 3 || fd == self) continue;
+        if (count == cap) {
+            closedir(dir);
+            return -1;
+        }
+        out[count++] = fd;
+    }
+    closedir(dir);
+    return count;
+}
+
+static int setWindowSize(int ptmx, jlong size) {
+    static_assert(sizeof(jlong) == sizeof(winsize));
+    winsize w = *((winsize *) &size);
+
+    LOGD("setWindowSize %d %d %d %d", w.ws_row, w.ws_col, w.ws_xpixel, w.ws_ypixel);
+
+    if (ioctl(ptmx, TIOCSWINSZ, &w) == -1) {
+        PLOGE("ioctl TIOCGWINSZ");
+        return -1;
+    }
+    return 0;
+}
+
+// libcore/ojluni/src/main/native/UNIXProcess_md.c
+
+static void *xmalloc(JNIEnv *env, size_t size) {
+    void *p = malloc(size);
+    if (p == nullptr)
+        env->ThrowNew(env->FindClass("java/lang/OutOfMemoryError"), nullptr);
+    else
+        memset(p, 0, size);
+    return p;
+}
+
+#define NEW(type, n) ((type *) xmalloc(env, (n) * sizeof(type)))
+
+static const char *getBytes(JNIEnv *env, jbyteArray arr) {
+    return arr == nullptr ? nullptr : (const char *) env->GetByteArrayElements(arr, nullptr);
+}
+
+static void releaseBytes(JNIEnv *env, jbyteArray arr, const char *parr) {
+    if (parr != nullptr)
+        env->ReleaseByteArrayElements(arr, (jbyte *) parr, JNI_ABORT);
+}
+
+static void initVectorFromBlock(const char **vector, const char *block, int count) {
+    int i;
+    const char *p;
+    for (i = 0, p = block; i < count; i++) {
+        /* Invariant: p always points to the start of a C string. */
+        vector[i] = p;
+        while (*(p++));
+    }
+    vector[count] = nullptr;
+}
+
+static jintArray PtyHost_start(
+        JNIEnv *env, jclass clazz,
+        jbyteArray argBlock, jint argc,
+        jbyteArray envBlock, jint envc,
+        jbyteArray dirBlock,
+        jbyte tty,
+        jint stdin_read, jint stdout_write, jint stderr_write) {
+
+    bool in_tty = tty & ATTY_IN;
+    bool out_tty = tty & ATTY_OUT;
+    bool err_tty = tty & ATTY_ERR;
+    // Without a PTY the client's pipes become the shell's stdio as they are: nothing is copied
+    // here, and once we drop our copies the client sees EOF when the shell is done (and vice versa).
+    bool direct = tty == 0;
+
+    LOGD("[START] PtyHost_start");
+    LOGD("[MODE ] tty=0x%02x in_tty=%d out_tty=%d err_tty=%d",
+         tty, in_tty ? 1 : 0, out_tty ? 1 : 0, err_tty ? 1 : 0);
+
+    LOGD("[FD   ] client stdin_read=%d stdout_write=%d stderr_write=%d",
+         stdin_read, stdout_write, stderr_write); // [LOG+]
+
+    int ptmx = -1;
+    if (tty) {
+        ptmx = open_ptmx();
+        if (ptmx == -1) {
+            env->ThrowNew(env->FindClass("java/lang/IllegalStateException"), "Unable to open ptmx");
+            return nullptr;
+        }
+        LOGD("[PTY  ] ptmx=%d", ptmx);
+    } else {
+        LOGD("[PIPE ] tty==0, PTY disabled"); // [LOG+]
+    }
+
+    int stdin_pipe[2]{-1}, stdout_pipe[2]{-1}, stderr_pipe[2]{-1};
+
+    LOGD("[TTY? ] istty in=%d out=%d err=%d",
+         (tty & ATTY_IN) ? 1 : 0,
+         (tty & ATTY_OUT) ? 1 : 0,
+         (tty & ATTY_ERR) ? 1 : 0);
+
+    if (!in_tty && !direct) {
+        pipe2(stdin_pipe, 0);
+        LOGD("[PIPE ] stdin_pipe r=%d w=%d", stdin_pipe[0], stdin_pipe[1]); // [LOG+]
+    }
+    if (!out_tty && !direct) {
+        pipe2(stdout_pipe, 0);
+        LOGD("[PIPE ] stdout_pipe r=%d w=%d", stdout_pipe[0], stdout_pipe[1]); // [LOG+]
+    }
+    if (!err_tty && !direct) {
+        pipe2(stderr_pipe, 0);
+        LOGD("[PIPE ] stderr_pipe r=%d w=%d", stderr_pipe[0], stderr_pipe[1]); // [LOG+]
+    }
+
+    // The full argv, program first: argv[0] is what gets exec'd.
+    const char *pargBlock = getBytes(env, argBlock);
+    const char **argv = NEW(const char *, argc + 1);
+    initVectorFromBlock(argv, pargBlock, argc);
+
+    for (int i = 0; i < argc; ++i) {
+        LOGD("[ARGV ] arg%d=%s", i, argv[i]);
+    }
+
+    const char **envv = nullptr;
+    const char *penvBlock = nullptr;
+    if (envc > 0) {
+        penvBlock = getBytes(env, envBlock);
+        envv = NEW(const char *, envc + 1);
+
+        initVectorFromBlock(envv, penvBlock, envc);
+        LOGD("[ENV  ] envc=%d", envc); // [LOG+]
+    } else {
+        LOGD("[ENV  ] no env"); // [LOG+]
+    }
+
+    const char *pdir = nullptr;
+    if (dirBlock) {
+        pdir = getBytes(env, dirBlock);
+        LOGD("[CWD  ] requested dir=%s", pdir); // [LOG+]
+    }
+
+    // As late as possible: an fd another thread opens after this isn't in the list.
+    int open_fds[1024];
+    const int open_count = has_close_range() ? -1 : list_open_fds(open_fds, 1024);
+
+    // Without a PTY the child only rearranges fds and execs, so it borrows our memory (vfork)
+    // instead of getting a copy of this process's page tables, which is most of what a fork of
+    // the server costs on a slow device. It must never return from here, write to a global or
+    // log: [quiet] keeps CLOG silent in it. The caller waits until the child execs, so a
+    // requested directory (a chdir that could hang on a stuck mount) keeps the plain fork.
+    const bool use_vfork = direct && pdir == nullptr;
+    const bool quiet = use_vfork;
+    timespec forkStart{}, forkEnd{};
+    clock_gettime(CLOCK_MONOTONIC, &forkStart);
+    auto pid = use_vfork ? vfork() : fork();
+    if (pid > 0) {
+        clock_gettime(CLOCK_MONOTONIC, &forkEnd);
+        LOGW("[FORK ] %s took %lld us (pid=%d)", use_vfork ? "vfork+exec" : "fork",
+             (long long) ((forkEnd.tv_sec - forkStart.tv_sec) * 1000000LL +
+                          (forkEnd.tv_nsec - forkStart.tv_nsec) / 1000), pid);
+    }
+    if (pid == -1) {
+        releaseBytes(env, argBlock, pargBlock);
+        releaseBytes(env, envBlock, penvBlock);
+        releaseBytes(env, dirBlock, pdir);
+        LOGE("[FORK ] fork failed");
+        env->ThrowNew(env->FindClass("java/lang/IllegalStateException"),
+                      "Unable to fork");
+        return nullptr;
+    }
+
+    /* =========================
+     * PARENT
+     * ========================= */
+    if (pid > 0) {
+        releaseBytes(env, argBlock, pargBlock);
+        releaseBytes(env, envBlock, penvBlock);
+        releaseBytes(env, dirBlock, pdir);
+        LOGD("[PARENT] pid=%d", pid); // [LOG+]
+
+        if (direct) {
+            // The child has them; ours would keep the client from ever seeing EOF.
+            LOGD("[PARENT] direct: client pipes are the child's stdio");
+            close(stdin_read);
+            close(stdout_write);
+            if (stderr_write >= 0) close(stderr_write);
+            auto result = env->NewIntArray(2);
+            env->SetIntArrayRegion(result, 0, 1, &pid);
+            env->SetIntArrayRegion(result, 1, 1, &ptmx);
+            return result;
+        }
+
+        auto called = std::make_shared<std::atomic_bool>(false);
+        auto func = [pid, called]() {
+            if (called->exchange(true)) {
+                return;
+            }
+
+            LOGW("[PARENT] client dead, kill child pid=%d", pid);
+            kill(pid, SIGKILL);
+        };
+
+        if (in_tty) {
+            LOGD("[PARENT] stdin: client -> ptmx"); // [LOG+]
+            transfer_async(stdin_read, ptmx);
+        } else {
+            LOGD("[PARENT] stdin: client -> pipe"); // [LOG+]
+            transfer_async(stdin_read, stdin_pipe[1]);
+            close(stdin_pipe[0]);
+        }
+
+        if (out_tty) {
+            LOGD("[PARENT] stdout: ptmx -> client"); // [LOG+]
+            transfer_async(ptmx, stdout_write, func);
+        } else {
+            LOGD("[PARENT] stdout: pipe -> client"); // [LOG+]
+            transfer_async(stdout_pipe[0], stdout_write, func);
+            close(stdout_pipe[1]);
+        }
+
+        if (!err_tty) {
+            LOGD("[PARENT] stderr: pipe -> client"); // [LOG+]
+            transfer_async(stderr_pipe[0], stderr_write);
+            close(stderr_pipe[1]);
+        } else {
+            LOGD("[PARENT] stderr: via ptmx"); // [LOG+]
+        }
+
+        auto result = env->NewIntArray(2);
+        env->SetIntArrayRegion(result, 0, 1, &pid);
+        env->SetIntArrayRegion(result, 1, 1, &ptmx);
+        return result;
+    } else {
+        /* =========================
+     * CHILD
+     * ========================= */
+        CLOG("[CHILD ] pid=%d starting", getpid()); // [LOG+]
+
+        if (setsid() < 0) {
+            PLOGE("[CHILD ] setsid failed");
+            _exit(1);
+        }
+
+        if (pdir) {
+            CLOG("[CHILD ] chdir attempt: %s", pdir);
+            if (access(pdir, X_OK) == 0) {
+                if (chdir(pdir) == -1) {
+                    PLOGE("[CHILD ] chdir failed");
+                } else {
+                    CLOG("[CHILD ] chdir ok");
+                }
+            } else {
+                PLOGE("[CHILD ] access denied");
+            }
+        }
+
+        int pts = -1;
+        if (tty) {
+            char pts_slave[PATH_MAX]{0};
+            if (ptsname_r(ptmx, pts_slave, PATH_MAX - 1) == -1) {
+                PLOGE("[CHILD ] ptsname_r failed");
+                _exit(1);
+            }
+
+            if ((pts = open(pts_slave, O_RDWR)) == -1) {
+                PLOGE("[CHILD ] open pts failed");
+            }
+            CLOG("[CHILD ] pts=%d (%s)", pts, pts_slave);
+        } else {
+            CLOG("[CHILD ] no PTY, pipe mode");
+        }
+
+        if (direct) {
+            dup2(stdin_read, STDIN_FILENO);
+            dup2(stdout_write, STDOUT_FILENO);
+            dup2(stderr_write >= 0 ? stderr_write : stdout_write, STDERR_FILENO);
+            const int client_fds[] = {stdin_read, stdout_write, stderr_write};
+            for (int fd : client_fds) {
+                if (fd > STDERR_FILENO) close(fd);
+            }
+            CLOG("[CHILD ] stdio <- client pipes");
+        } else if (in_tty) {
+            dup2(pts, STDIN_FILENO);
+            CLOG("[CHILD ] stdin <- pts");
+        } else {
+            dup2(stdin_pipe[0], STDIN_FILENO);
+            close(stdin_pipe[1]);
+            CLOG("[CHILD ] stdin <- pipe");
+        }
+
+        if (direct) {
+            // stdout and stderr were set above.
+        } else if (out_tty) {
+            dup2(pts, STDOUT_FILENO);
+            CLOG("[CHILD ] stdout <- pts");
+        } else {
+            dup2(stdout_pipe[1], STDOUT_FILENO);
+            close(stdout_pipe[0]);
+            CLOG("[CHILD ] stdout <- pipe");
+        }
+
+        if (direct) {
+            // As above.
+        } else if (err_tty) {
+            dup2(pts, STDERR_FILENO);
+            CLOG("[CHILD ] stderr <- pts");
+        } else {
+            dup2(stderr_pipe[1], STDERR_FILENO);
+            close(stderr_pipe[0]);
+            CLOG("[CHILD ] stderr <- pipe");
+        }
+
+        CLOG("[CHILD ] isatty stdin=%d stdout=%d stderr=%d",
+             isatty(STDIN_FILENO),
+             isatty(STDOUT_FILENO),
+             isatty(STDERR_FILENO));
+
+        if (pts != -1) {
+            close(pts);
+        }
+
+        CLOG("[EXEC ] exec %s", argv[0]); // [LOG+]
+        // Last: logging above may still use an fd of its own.
+        close_inherited_fds(open_fds, open_count);
+
+        if (envv) {
+            // execvpe looks argv[0] up in getenv("PATH"), the server's own PATH, not envv's: a
+            // bare command would ignore the PATH order it was given (preferSystemBinaries).
+            exec_with_path(argv[0], (char *const *) argv, (char *const *) envv);
+        } else {
+            execvp(argv[0], (char *const *) argv);
+        }
+        PLOGE("execv");
+        _exit(127);
+    }
+}
+
+
+static void PtyHost_setWindowSize(JNIEnv *env, jclass clazz, jint ptmx, jlong size) {
+    setWindowSize(ptmx, size);
+}
+
+static jint PtyHost_waitFor(JNIEnv *env, jclass clazz, jint pid) {
+    if (pid < 0)
+        return -1;
+
+    int status;
+    int w;
+    do {
+        w = TEMP_FAILURE_RETRY(waitpid(pid, &status, 0));
+        if (w == -1) {
+            if (errno == ECHILD) {
+                return 0;
+            }
+            PLOGE("waitpid");
+            return -1;
+        }
+
+        if (WIFEXITED(status)) {
+            LOGD("exited with %d", WEXITSTATUS(status));
+            return WEXITSTATUS(status);
+        } else if (WIFSIGNALED(status)) {
+            LOGD("killed by signal %d", WTERMSIG(status));
+            return 0;
+        }
+    } while (!WIFEXITED(status) && !WIFSIGNALED(status));
+
+    return -1;
+}
+
+// libaxsh_host.so: loaded only by the server, which hosts the remote shells (PTY or pipes).
+JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *reserved) {
+    JNIEnv *env = nullptr;
+    if (vm->GetEnv((void **) &env, JNI_VERSION_1_6) != JNI_OK) return -1;
+
+    auto clazz = env->FindClass("frb/axeron/shell/host/PtyHost");
+    if (clazz == nullptr) return JNI_ERR;
+    JNINativeMethod methods[] = {
+            {"start",         "([BI[BI[BBIII)[I", (void *) PtyHost_start},
+            {"setWindowSize", "(IJ)V",            (void *) PtyHost_setWindowSize},
+            {"waitFor",       "(I)I",             (void *) PtyHost_waitFor},
+    };
+    if (env->RegisterNatives(clazz, methods, sizeof(methods) / sizeof(methods[0])) != JNI_OK) {
+        return JNI_ERR;
+    }
+    return JNI_VERSION_1_6;
+}
