@@ -19,8 +19,10 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
@@ -55,6 +57,14 @@ import kotlin.math.abs
 import kotlin.math.sign
 
 /**
+ * Callback a tab's click handler uses to select that tab inside [LiquidBottomTabs].
+ * Selection is routed through the bar's internal state so the lens animates to the tab
+ * and [LiquidBottomTabs.onTabSelected] fires exactly once, in order.
+ */
+internal val LocalLiquidBottomTabsSelection =
+    staticCompositionLocalOf<(Int) -> Unit> { { } }
+
+/**
  * A floating Liquid Glass tab bar, ported from the AndroidLiquidGlass catalog
  * (`LiquidBottomTabs` in the library's demo app, Apache-2.0).
  *
@@ -68,6 +78,16 @@ import kotlin.math.sign
  *
  * The tab strip can be dragged: dragging moves the lens, and releasing snaps to the nearest
  * tab and calls [onTabSelected].
+ *
+ * Follow/consistency fixes on top of the catalog port:
+ *  - [selectedTabIndex] is captured through `rememberUpdatedState` so the lambda identity
+ *    churn from the parent (recreated every recomposition) no longer resets the remembered
+ *    state or races the `snapshotFlow` watcher.
+ *  - Selection is driven from a single [currentIndex] state: clicks update it and the lens
+ *    animates after it, `onTabSelected` fires exactly once per change through `snapshotFlow`.
+ *  - During drag the lens tracks the finger directly (`snapTo` on the same frame), and the
+ *    glass bar's panel offset is applied immediately instead of through a queued spring,
+ *    which removes the visible lag on quick flicks.
  */
 @Composable
 fun LiquidBottomTabs(
@@ -95,6 +115,10 @@ fun LiquidBottomTabs(
             (constraints.maxWidth.toFloat() - 8f.dp.toPx()) / tabsCount
         }
 
+        // Keep the latest lambda without letting its identity restart our state.
+        val currentSelectedTabIndex by rememberUpdatedState(selectedTabIndex)
+        val latestOnTabSelected by rememberUpdatedState(onTabSelected)
+
         val offsetAnimation = remember { Animatable(0f) }
         val panelOffset by remember(density) {
             derivedStateOf {
@@ -107,13 +131,25 @@ fun LiquidBottomTabs(
 
         val isLtr = LocalLayoutDirection.current == LayoutDirection.Ltr
         val animationScope = rememberCoroutineScope()
-        var currentIndex by remember(selectedTabIndex) {
-            mutableIntStateOf(selectedTabIndex())
+
+        // Internal selection state; kept in sync with the parent by [selectionSyncEffect].
+        var currentIndex by remember {
+            mutableIntStateOf(currentSelectedTabIndex())
         }
+
+        // Tab clicks (from the content row) route through this so the lens animates to the
+        // tab and onTabSelected fires exactly once, via the currentIndex effect below.
+        val selectTab: (Int) -> Unit = { index ->
+            val clamped = index.fastCoerceIn(0, tabsCount - 1)
+            if (clamped != currentIndex) {
+                currentIndex = clamped
+            }
+        }
+
         val dampedDragAnimation = remember(animationScope) {
             DampedDragAnimation(
                 animationScope = animationScope,
-                initialValue = selectedTabIndex().toFloat(),
+                initialValue = currentSelectedTabIndex().toFloat(),
                 valueRange = 0f..(tabsCount - 1).toFloat(),
                 visibilityThreshold = 0.001f,
                 initialScale = 1f,
@@ -122,7 +158,7 @@ fun LiquidBottomTabs(
                 onDragStopped = {
                     val targetIndex = targetValue.fastRoundToInt().fastCoerceIn(0, tabsCount - 1)
                     currentIndex = targetIndex
-                    animateToValue(targetIndex.toFloat())
+                    // Settle the glass bar back to center after the drag.
                     animationScope.launch {
                         offsetAnimation.animateTo(0f, spring(1f, 300f, 0.5f))
                     }
@@ -132,26 +168,35 @@ fun LiquidBottomTabs(
                         (targetValue + dragAmount.x / tabWidth * if (isLtr) 1f else -1f)
                             .fastCoerceIn(0f, (tabsCount - 1).toFloat())
                     )
+                    // Follow the finger on the same frame; no queueing.
                     animationScope.launch {
                         offsetAnimation.snapTo(offsetAnimation.value + dragAmount.x)
                     }
                 }
             )
         }
-        LaunchedEffect(selectedTabIndex) {
-            snapshotFlow { selectedTabIndex() }
+
+        // Parent selection -> internal index. Runs for the lifetime of the component.
+        LaunchedEffect(Unit) {
+            snapshotFlow { currentSelectedTabIndex() }
                 .collectLatest { index ->
-                    currentIndex = index
+                    if (index != currentIndex) {
+                        currentIndex = index
+                    }
                 }
         }
-        LaunchedEffect(dampedDragAnimation) {
+
+        // Internal index -> animate the lens + notify the parent exactly once per change.
+        LaunchedEffect(Unit) {
             snapshotFlow { currentIndex }
                 .drop(1)
                 .collectLatest { index ->
                     dampedDragAnimation.animateToValue(index.toFloat())
-                    onTabSelected(index)
+                    latestOnTabSelected(index)
                 }
         }
+
+        CompositionLocalProvider(LocalLiquidBottomTabsSelection provides selectTab) {
 
         val interactiveHighlight = remember(animationScope) {
             InteractiveHighlight(
@@ -295,5 +340,7 @@ fun LiquidBottomTabs(
                 .height(56f.dp)
                 .fillMaxWidth(1f / tabsCount)
         )
+
+        } // CompositionLocalProvider(LocalLiquidBottomTabsSelection)
     }
 }

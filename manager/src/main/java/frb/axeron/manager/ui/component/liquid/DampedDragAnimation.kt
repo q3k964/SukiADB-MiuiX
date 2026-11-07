@@ -7,15 +7,14 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.input.pointer.util.VelocityTracker
 import androidx.compose.ui.unit.IntSize
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.android.awaitFrame
 import kotlinx.coroutines.launch
 import kotlin.math.abs
-import kotlin.time.Clock
 
 class DampedDragAnimation(
     private val animationScope: CoroutineScope,
@@ -53,7 +52,7 @@ class DampedDragAnimation(
 
     private val mutatorMutex = MutatorMutex()
 
-    private val velocityTracker = VelocityTracker()
+    private var previousValue = initialValue
 
     val value: Float get() = valueAnimation.value
     val progress: Float get() = (value - valueRange.start) / (valueRange.endInclusive - valueRange.start)
@@ -83,11 +82,13 @@ class DampedDragAnimation(
     }
 
     fun press() {
-        velocityTracker.resetTracking()
+        // Start all three spring animations concurrently on the same frame.
         animationScope.launch {
-            launch { pressProgressAnimation.animateTo(1f, pressProgressAnimationSpec) }
-            launch { scaleXAnimation.animateTo(pressedScale, scaleXAnimationSpec) }
-            launch { scaleYAnimation.animateTo(pressedScale, scaleYAnimationSpec) }
+            coroutineScope {
+                launch { pressProgressAnimation.animateTo(1f, pressProgressAnimationSpec) }
+                launch { scaleXAnimation.animateTo(pressedScale, scaleXAnimationSpec) }
+                launch { scaleYAnimation.animateTo(pressedScale, scaleYAnimationSpec) }
+            }
         }
     }
 
@@ -108,9 +109,19 @@ class DampedDragAnimation(
 
     fun updateValue(value: Float) {
         val targetValue = value.coerceIn(valueRange)
+        // Direct tracking while dragging: snap to the finger instead of chasing it with a
+        // spring, which is what made the lens lag behind fast drags. The release snap
+        // (animateToValue) still springs to the nearest tab for a smooth settle.
+        // snapTo is a suspend call; launching it on the shared scope still applies the new
+        // value on the same frame, with no animation chasing in between. Velocity is a
+        // cheap per-frame displacement estimate for the squeeze stretch, no tracker churn.
         animationScope.launch {
-            launch { valueAnimation.animateTo(targetValue, valueAnimationSpec) { updateVelocity() } }
+            valueAnimation.snapTo(targetValue)
+            velocityAnimation.snapTo(
+                (targetValue - previousValue).coerceIn(-0.5f, 0.5f)
+            )
         }
+        previousValue = targetValue
     }
 
     fun animateToValue(value: Float) {
@@ -125,14 +136,5 @@ class DampedDragAnimation(
                 release()
             }
         }
-    }
-
-    private fun updateVelocity() {
-        velocityTracker.addPosition(
-            Clock.System.now().toEpochMilliseconds(),
-            Offset(value, 0f)
-        )
-        val targetVelocity = velocityTracker.calculateVelocity().x / (valueRange.endInclusive - valueRange.start)
-        animationScope.launch { velocityAnimation.animateTo(targetVelocity, velocityAnimationSpec) }
     }
 }

@@ -82,6 +82,7 @@ import frb.axeron.manager.ui.component.FloatingBarFabHost
 import frb.axeron.manager.ui.component.FloatingBarFabSlot
 import frb.axeron.manager.ui.component.liquid.LiquidBottomTab
 import frb.axeron.manager.ui.component.liquid.LiquidBottomTabs
+import frb.axeron.manager.ui.component.liquid.LocalLiquidBottomTabsSelection
 import frb.axeron.manager.ui.component.LocalFloatingBarFabHost
 import frb.axeron.manager.ui.navigation.BottomBarDestination
 import frb.axeron.manager.ui.screen.FlashIt
@@ -384,7 +385,8 @@ class AxActivity : ComponentActivity() {
                             accentColor = MaterialTheme.colorScheme.primary,
                             modifier = Modifier.fillMaxWidth()
                         ) {
-                            tabs.forEach { destination ->
+                            val selectTab = LocalLiquidBottomTabsSelection.current
+                            tabs.forEachIndexed { index, destination ->
                                 val selected = destination.direction.route ==
                                         navController.currentDestination?.route
                                 val contentColor = if (selected) {
@@ -395,11 +397,7 @@ class AxActivity : ComponentActivity() {
 
                                 LiquidBottomTab(
                                     onClick = {
-                                        navigator.navigate(destination.direction) {
-                                            popUpTo(NavGraphs.root) { saveState = true }
-                                            launchSingleTop = true
-                                            restoreState = true
-                                        }
+                                        selectTab(index)
                                     }
                                 ) {
                                     if (destination == BottomBarDestination.Plugin &&
