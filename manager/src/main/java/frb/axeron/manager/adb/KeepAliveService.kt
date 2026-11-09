@@ -16,6 +16,7 @@ import frb.axeron.api.Axeron
 import frb.axeron.manager.R
 import frb.axeron.manager.ui.AxActivity
 import frb.axeron.shell.Axsh
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -24,6 +25,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -56,6 +58,13 @@ class KeepAliveService : Service() {
         /** First retry gap after a failed replay, doubling up to [MAX_RETRY_MS]. */
         private const val MIN_RETRY_MS = 30_000L
         private const val MAX_RETRY_MS = 10 * 60_000L
+
+        /**
+         * Upper bound on one replay. The activation chain waits on Wi-Fi and on an mDNS lookup,
+         * neither of which has its own timeout; without this the keep-alive loop could sit in
+         * replay() forever instead of retrying, which looked like "stuck on connecting".
+         */
+        private const val REPLAY_TIMEOUT_MS = 60_000L
 
         private val running = AtomicBoolean(false)
 
@@ -107,8 +116,17 @@ class KeepAliveService : Service() {
     }
 
     override fun onDestroy() {
+        // Clear the flag before the process can be restarted: START_STICKY brings the service
+        // back after the OS reclaims it, and onStartCommand refuses to start the loop while
+        // `running` is still true. If onDestroy never ran (process killed outright) the flag
+        // is stale in a dead process, so this only matters for a clean stop — but that is
+        // exactly the path stop()/setEnabled(false)→true takes, where the service used to
+        // come back alive with no loop watching the binder ("自动断开").
         running.set(false)
         job?.cancel()
+        job = null
+        // Cancel the scope last: cancelling it first kills the job's own cancellation handlers,
+        // and applySelfPersistence()/replay() would be left half-finished on a dead dispatcher.
         scope.cancel()
         super.onDestroy()
     }
@@ -159,17 +177,34 @@ class KeepAliveService : Service() {
 
     /** Replays the boot watchdog's chain: wireless debugging → port → adbd → server. */
     private suspend fun replay(): Boolean {
-        var ok = false
-        // 两个 lambda 必须显式分开：Kotlin 只允许一个尾随 lambda，
-        // 写成 f(x) { } { } 是语法错误。
+        // The real hang is inside startAdbWireless: it waits for the ADB port with
+        // callbackFlow { … }.first(), and that flow only closes from the mDNS callback, the
+        // Wi-Fi gate's onFail, or the wireless-debugging gate's onFail. If Wi-Fi is on but
+        // mDNS never resolves (HyperOS turns wireless debugging back off, the port is
+        // randomized after a network change, or nothing answers the _adb-tls-connect service),
+        // none of those branches fire: first() suspends forever, replay() never returns, and
+        // loop() is stuck inside it. The notification then stays on "reconnecting" and the
+        // binder is never pinged again — exactly the "激活守护一直在连接中" plus "自动断开"
+        // reports. Neither the Wi-Fi gate nor the mDNS lookup has a timeout of its own.
+        //
+        // Bounding the whole chain makes the loop recover: on timeout the outcome is
+        // completed as a failure, the loop backs off and retries instead of wedging.
+        val outcome = CompletableDeferred<Boolean>()
         runCatching {
-            AdbStarter.startAdbWireless(
-                context = this,
-                onStep = {},
-                result = { info -> ok = info is AdbStateInfo.Success }
-            )
-        }.onFailure { Log.e(TAG, "replay failed", it) }
-        return ok
+            withTimeoutOrNull(REPLAY_TIMEOUT_MS) {
+                AdbStarter.startAdbWireless(
+                    context = this,
+                    onStep = {},
+                    result = { info -> outcome.complete(info is AdbStateInfo.Success) }
+                )
+            }
+        }.onFailure {
+            Log.e(TAG, "replay failed", it)
+            outcome.complete(false)
+        }
+        // No report at all (timeout, or the chain returned without calling result): failure.
+        outcome.complete(false)
+        return outcome.await()
     }
 
     /**

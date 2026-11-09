@@ -9,6 +9,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.unit.IntSize
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
@@ -110,12 +111,16 @@ class DampedDragAnimation(
     fun updateValue(value: Float) {
         val targetValue = value.coerceIn(valueRange)
         // Direct tracking while dragging: snap to the finger instead of chasing it with a
-        // spring, which is what made the lens lag behind fast drags. The release snap
-        // (animateToValue) still springs to the nearest tab for a smooth settle.
-        // snapTo is a suspend call; launching it on the shared scope still applies the new
-        // value on the same frame, with no animation chasing in between. Velocity is a
-        // cheap per-frame displacement estimate for the squeeze stretch, no tracker churn.
-        animationScope.launch {
+        // spring, which is what made the lens lag behind fast drags.
+        //
+        // UNDISPATCHED is what actually makes it track the finger. A plain launch() posts the
+        // block to the Main dispatcher, so a move event arriving in the same frame as a pending
+        // animation frame ran *after* that frame: the lens drew the previous position and
+        // visibly trailed the finger, and on fast drags several updates queued up behind
+        // animateToValue's mutator lock. Running undispatched executes snapTo immediately on
+        // the pointer thread up to its first suspension point, so the new value is visible to
+        // the very next draw pass.
+        animationScope.launch(start = CoroutineStart.UNDISPATCHED) {
             valueAnimation.snapTo(targetValue)
             velocityAnimation.snapTo(
                 (targetValue - previousValue).coerceIn(-0.5f, 0.5f)
@@ -125,7 +130,10 @@ class DampedDragAnimation(
     }
 
     fun animateToValue(value: Float) {
-        animationScope.launch {
+        // Undispatched for the same reason: a tap must move the lens on the frame it happens,
+        // not one frame later. This is the "点过去不跟上" symptom — selectTab() changed the
+        // index, the effect launched this coroutine, and the launch itself cost a frame.
+        animationScope.launch(start = CoroutineStart.UNDISPATCHED) {
             mutatorMutex.mutate {
                 press()
                 val targetValue = value.coerceIn(valueRange)
